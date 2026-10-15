@@ -561,12 +561,21 @@ export function create(options: create.Options = {}): create.ReturnType {
   async function revokeAccessKey(parameters: Adapter.revokeAccessKey.Parameters) {
     const selected = await getAdapterAccount({ address: parameters.address })
     const feePayer = parameters.feePayer
+    const chainId = Number(parameters.chainId ?? store.getState().chainId)
     const client = getWalletClient({
       account: selected.account,
+      chainId,
       feePayer: feePayer === true ? undefined : feePayer,
       transport: selected.transport,
     })
     if (selected.account.type === 'json-rpc') {
+      // A wallet reached only through the account transport acts on the
+      // active chain, so this path cannot route a revocation elsewhere.
+      const { chainId: active } = store.getState()
+      if (chainId !== active)
+        throw new ox_Provider.UnsupportedChainIdError({
+          message: `Revoking on chain ${chainId} requires it to be the active chain (${active}).`,
+        })
       await client.request({
         method: 'wallet_revokeAccessKey' as never,
         params: [z.encode(Rpc.wallet_revokeAccessKey.parameters, parameters)] as never,
@@ -586,7 +595,7 @@ export function create(options: create.Options = {}): create.ReturnType {
     store.accessKeys.remove({
       accessKey: parameters.accessKeyAddress,
       account: parameters.address,
-      chainId: store.getState().chainId,
+      chainId,
     })
   }
 
@@ -684,6 +693,15 @@ export function create(options: create.Options = {}): create.ReturnType {
     )
       throw new RpcResponse.InvalidParamsError({
         message: '`keyAuthorization` must authorize `accessKeyAddress`.',
+      })
+    // Clients fall back to the default chain for unknown chain IDs, which
+    // would revoke on a chain the caller did not name.
+    if (
+      parameters.chainId !== undefined &&
+      !chains.some((chain) => chain.id === Number(parameters.chainId))
+    )
+      throw new ox_Provider.UnsupportedChainIdError({
+        message: `Chain ${parameters.chainId} not configured.`,
       })
     if (actions.revokeAccessKey) return await actions.revokeAccessKey(parameters, request)
     if (instance.getAccount) return await revokeAccessKey(parameters)
