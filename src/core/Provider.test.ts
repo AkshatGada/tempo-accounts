@@ -8,6 +8,7 @@ import { accounts, privateKeys } from '../../test/config.js'
 import * as Adapter from './Adapter.js'
 import * as Provider from './Provider.js'
 import * as Storage from './Storage.js'
+import * as Store from './Store.js'
 
 const address = '0x0000000000000000000000000000000000000001'
 
@@ -301,6 +302,148 @@ describe('getMppxParameters', () => {
         operation: { kind: 'authorizePaymentChannel' },
       }),
     ).rejects.toThrowError(`Account "${payer.address}" not found.`)
+  })
+})
+
+describe('ready', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  const adapter = Adapter.define({ name: 'Test Wallet', rdns: 'com.example.test' }, () => ({
+    actions: {
+      async createAccount() {
+        return { accounts: [{ address }] }
+      },
+      async loadAccounts() {
+        return { accounts: [{ address }] }
+      },
+    },
+  }))
+
+  const stored = {
+    state: { accounts: [{ address }], activeAccount: 0, chainId: tempo.id },
+    version: 0,
+  }
+
+  test('default: synchronous storage loads before create returns', async () => {
+    const storage = Storage.memory()
+    storage.setItem('store', stored)
+    const provider = Provider.create({ storage })
+
+    expect(provider.getAccount()).toMatchInlineSnapshot(`
+      {
+        "address": "0x0000000000000000000000000000000000000001",
+        "type": "json-rpc",
+      }
+    `)
+    expect(await provider.request({ method: 'eth_accounts' })).toMatchInlineSnapshot(`
+      [
+        "0x0000000000000000000000000000000000000001",
+      ]
+    `)
+  })
+
+  test('behavior: request and getAccount wait for a slow storage read', async () => {
+    let resolve!: () => void
+    const read = new Promise<void>((r) => (resolve = r))
+    const storage = {
+      async getItem<value>(name: string) {
+        await read
+        if (name !== 'store') return null
+        return stored as value
+      },
+      removeItem() {},
+      setItem() {},
+    } satisfies Storage.Storage
+    const provider = Provider.create({ storage })
+
+    expect(() => provider.getAccount()).toThrowErrorMatchingInlineSnapshot(
+      `[Store.HydrationError: Persisted state is still loading from storage. Await \`provider.ready()\` first.]`,
+    )
+    const accounts = provider.request({ method: 'eth_accounts' })
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    resolve()
+
+    expect(await accounts).toMatchInlineSnapshot(`
+      [
+        "0x0000000000000000000000000000000000000001",
+      ]
+    `)
+    await provider.ready()
+    expect(provider.getAccount()).toMatchInlineSnapshot(`
+      {
+        "address": "0x0000000000000000000000000000000000000001",
+        "type": "json-rpc",
+      }
+    `)
+  })
+
+  test('behavior: default storage is memory where window has no IndexedDB', async () => {
+    // React Native exposes `window` without `indexedDB`.
+    vi.stubGlobal('window', new EventTarget())
+    const provider = Provider.create({ adapter })
+
+    await provider.ready()
+    expect(await provider.request({ method: 'eth_accounts' })).toMatchInlineSnapshot(`[]`)
+  })
+
+  test('behavior: default storage falls back to memory when IndexedDB fails', async () => {
+    vi.stubGlobal('window', new EventTarget())
+    vi.stubGlobal('indexedDB', {
+      open() {
+        const request: { error?: Error; onerror?: () => void } = {}
+        queueMicrotask(() => {
+          request.error = new Error('IndexedDB unavailable')
+          request.onerror?.()
+        })
+        return request
+      },
+    })
+    const provider = Provider.create({ adapter })
+
+    await provider.ready()
+    expect(await provider.request({ method: 'eth_accounts' })).toMatchInlineSnapshot(`[]`)
+  })
+
+  test('error: rejects when the storage read fails', async () => {
+    const storage = {
+      async getItem<value>(): Promise<value | null> {
+        throw new Error('disk unavailable')
+      },
+      removeItem() {},
+      setItem() {},
+    } satisfies Storage.Storage
+    const provider = Provider.create({ storage })
+
+    await expect(provider.ready()).rejects.toThrowErrorMatchingInlineSnapshot(
+      `[Store.HydrationError: Failed to load persisted state from storage.]`,
+    )
+    await expect(
+      provider.request({ method: 'eth_accounts' }),
+    ).rejects.toThrowErrorMatchingInlineSnapshot(
+      `[RpcResponse.InternalError: Failed to load persisted state from storage.]`,
+    )
+    await expect(provider.request({ method: 'eth_accounts' })).rejects.toHaveProperty(
+      'cause',
+      expect.any(Store.HydrationError),
+    )
+    expect(() => provider.getAccount()).toThrowErrorMatchingInlineSnapshot(
+      `[Store.HydrationError: Failed to load persisted state from storage.]`,
+    )
+  })
+
+  test('error: rejects when storage does not load within hydrationTimeout', async () => {
+    const storage = {
+      getItem: () => new Promise<never>(() => {}),
+      removeItem() {},
+      setItem() {},
+    } satisfies Storage.Storage
+    const provider = Provider.create({ hydrationTimeout: 10, storage })
+
+    await expect(
+      provider.request({ method: 'eth_accounts' }),
+    ).rejects.toThrowErrorMatchingInlineSnapshot(
+      `[RpcResponse.InternalError: Persisted state did not load from storage within 10ms.]`,
+    )
   })
 })
 

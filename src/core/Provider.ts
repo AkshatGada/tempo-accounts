@@ -61,6 +61,13 @@ export type Provider = ox_Provider.Provider<{ schema: Schema.Ox }> &
     }): ViemClient<Transport, typeof tempo>
     /** Returns mppx Tempo client parameters backed by this provider. */
     getMppxParameters(options?: getMppxParameters.Options | undefined): MppxParameters
+    /**
+     * Resolves once the provider has loaded its persisted state from `storage`.
+     * Rejects with `Store.HydrationError` when the load fails or takes longer than
+     * `hydrationTimeout`. `request` waits for this itself and rejects with an
+     * `RpcResponse.InternalError` caused by that error; await it before `getAccount`.
+     */
+    ready(): Promise<void>
     /** Reactive state store. */
     store: Store.Store
   }
@@ -99,11 +106,16 @@ export function create(options: create.Options = {}): create.ReturnType {
   const {
     adapter = dialog(),
     chains = [tempo, tempoModerato, tempoDevnet],
+    hydrationTimeout,
     maxAccounts,
     persistCredentials,
     relay,
     testnet,
-    storage = typeof window !== 'undefined' ? Storage.idb() : Storage.memory(),
+    // React Native can expose `window` without `indexedDB`. Where IndexedDB exists but
+    // fails, memory keeps the default usable instead of failing every request.
+    storage = typeof window !== 'undefined' && typeof indexedDB !== 'undefined'
+      ? Storage.combine(Storage.idb(), Storage.memory())
+      : Storage.memory(),
   } = options
   const authorizeAccessKey_default = options.accessKey?.authorize ?? options.authorizeAccessKey
   // Filled in below once the adapter instance exists (adapters may supply
@@ -147,7 +159,11 @@ export function create(options: create.Options = {}): create.ReturnType {
     storage,
   })
 
-  const getAccount: Account.Find = (options = {}) => Account.find({ ...options, store }) as never
+  const getAccount: Account.Find = (options = {}) => {
+    // An unloaded store holds no accounts yet, so reading it would report none.
+    Store.assertHydrated(store)
+    return Account.find({ ...options, store }) as never
+  }
   // Lazy reference — assigned after the provider is created so the client
   // transport can route provider methods (wallet_connect, etc.) through it.
   let providerRef: ox_Provider.Provider | undefined
@@ -930,7 +946,7 @@ export function create(options: create.Options = {}): create.ReturnType {
       {
         ...(emitter as unknown as ox_Provider.Emitter),
         async request({ method, params }: { method: string; params?: any }) {
-          await Store.waitForHydration(store)
+          await Store.waitForHydration(store, { timeout: hydrationTimeout })
 
           const shouldDedupe = [
             'eth_accounts',
@@ -1862,6 +1878,7 @@ export function create(options: create.Options = {}): create.ReturnType {
         })
       },
       getMppxParameters,
+      ready: () => Store.waitForHydration(store, { timeout: hydrationTimeout }),
       store,
     },
   )
@@ -1981,6 +1998,13 @@ export declare namespace create {
     /** Fee payer configuration. @see {@link Client.fromChainId.Options.feePayer} */
     feePayer?: Client.fromChainId.Options['feePayer']
     /**
+     * Milliseconds to wait for persisted state to load from `storage`. Past this,
+     * `ready` rejects with `Store.HydrationError`, and `request` with an
+     * `RpcResponse.InternalError` caused by it.
+     * @default 10_000
+     */
+    hydrationTimeout?: number | undefined
+    /**
      * Identity (verified email) token minting for local adapters. When a
      * `wallet_connect` request asks for `identity.email` and the adapter
      * returns no identity claims (local adapters have no wallet host to mint
@@ -2024,7 +2048,10 @@ export declare namespace create {
      * ```
      */
     relay?: string | undefined
-    /** Storage adapter for persistence. @default Storage.idb() in browser, Storage.memory() otherwise. */
+    /**
+     * Storage adapter for persistence.
+     * @default Storage.idb() with a Storage.memory() fallback where IndexedDB is available, Storage.memory() otherwise.
+     */
     storage?: Storage.Storage | undefined
     /**
      * Use testnet.
