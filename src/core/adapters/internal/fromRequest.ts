@@ -27,6 +27,7 @@ export function fromRequest(options: fromRequest.Options): Adapter.Adapter {
     name,
     rdns,
     request: requestRemote,
+    retryCount,
   } = options
 
   return Adapter.define(
@@ -136,7 +137,7 @@ export function fromRequest(options: fromRequest.Options): Adapter.Adapter {
               address: parameters.address ?? getAccount({ signable: false }).address,
               type: 'json-rpc' as const,
             },
-            transport: custom(provider),
+            transport: custom(provider, { retryCount }),
           }
         },
       }
@@ -199,5 +200,11 @@ export declare namespace fromRequest {
       /** Session selectors (active account + chain) for the wallet to act on. */
       context?: { account?: string | undefined; chainId?: number | undefined } | undefined
     }) => Promise<unknown>
+    /**
+     * Max retries for a failed wallet request sent through the account
+     * transport (e.g. signing or sending a transaction). Defaults to viem's
+     * transport default.
+     */
+    retryCount?: number | undefined
   }
 }
