@@ -102,8 +102,17 @@ export function fromRequest(options: fromRequest.Options): Adapter.Adapter {
           // the context carries the key's chain rather than the active one.
           async revokeAccessKey(parameters) {
             const chainId = Number(parameters.chainId ?? store.getState().chainId)
-            await requestRemote({
-              context: { account: parameters.address, chainId },
+            const context = { account: parameters.address, chainId }
+            // Sent through viem's `custom` transport so `retryCount` applies as
+            // it does to requests sent through the account transport.
+            const transport = custom(
+              {
+                request: (args: Parameters<typeof requestRemote>[0]) =>
+                  requestRemote({ ...args, context }),
+              },
+              { retryCount },
+            )({})
+            await transport.request({
               method: 'wallet_revokeAccessKey',
               params: [z.encode(Rpc.wallet_revokeAccessKey.parameters, parameters)],
             })
@@ -201,9 +210,9 @@ export declare namespace fromRequest {
       context?: { account?: string | undefined; chainId?: number | undefined } | undefined
     }) => Promise<unknown>
     /**
-     * Max retries for a failed wallet request sent through the account
-     * transport (e.g. signing or sending a transaction). Defaults to viem's
-     * transport default.
+     * Max retries for a failed wallet request sent through viem's transport
+     * (e.g. signing, sending a transaction, or revoking an access key).
+     * Defaults to viem's transport default.
      */
     retryCount?: number | undefined
   }
