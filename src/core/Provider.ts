@@ -619,6 +619,13 @@ export function create(options: create.Options = {}): create.ReturnType {
     const selected = await getAdapterAccount({ address: parameters.address })
     const chainId = Number(parameters.chainId ?? getClient().chain.id)
     if (selected.account.type === 'json-rpc') {
+      // A wallet reached only through the account transport acts on the
+      // active chain, so this path cannot route an update elsewhere.
+      const { chainId: active } = store.getState()
+      if (parameters.chainId !== undefined && chainId !== active)
+        throw new ox_Provider.UnsupportedChainIdError({
+          message: `Updating on chain ${chainId} requires it to be the active chain (${active}).`,
+        })
       const client = getWalletClient({
         account: selected.account,
         chainId,
@@ -719,6 +726,8 @@ export function create(options: create.Options = {}): create.ReturnType {
       throw new ox_Provider.UnsupportedChainIdError({
         message: `Chain ${parameters.chainId} not configured.`,
       })
+    // An unknown account fails here instead of reaching a remote wallet.
+    getAccount({ address: parameters.address })
     if (actions.revokeAccessKey) return await actions.revokeAccessKey(parameters, request)
     if (instance.getAccount) return await revokeAccessKey(parameters)
     unsupported('revokeAccessKey')
@@ -737,6 +746,8 @@ export function create(options: create.Options = {}): create.ReturnType {
       throw new ox_Provider.UnsupportedChainIdError({
         message: `Chain ${parameters.chainId} not configured.`,
       })
+    // An unknown account fails here instead of reaching a remote wallet.
+    getAccount({ address: parameters.address })
     if (actions.updateAccessKey) return await actions.updateAccessKey(parameters, request)
     if (instance.getAccount) return await updateAccessKey(parameters)
     unsupported('updateAccessKey')
