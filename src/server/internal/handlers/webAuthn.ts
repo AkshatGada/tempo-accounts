@@ -1,3 +1,4 @@
+import type { Context } from 'hono'
 import { Base64, Bytes, Hex } from 'ox'
 import { Credential } from 'ox/webauthn'
 import {
@@ -20,15 +21,21 @@ const defaults = {
 
 const sessionKey = (token: string) => `session:${token}`
 
-async function createCredential(
-  kv: Kv.Kv,
-  key: string,
-  value: { publicKey: string; userId?: string | undefined },
-) {
-  if (kv.create) return await kv.create(key, value)
-  if (await kv.get(key)) return false
-  await kv.set(key, value)
-  return true
+/**
+ * Runs `promise` after the response when the runtime exposes `waitUntil`
+ * (e.g. Cloudflare Workers via Hono's `executionCtx`). Otherwise awaits it,
+ * so runtimes that may stop work after the response still finish it.
+ */
+async function defer(c: Context, promise: Promise<unknown>) {
+  const ctx = (() => {
+    try {
+      return c.executionCtx
+    } catch {
+      return undefined
+    }
+  })()
+  if (!ctx) return void (await promise)
+  ctx.waitUntil(promise.catch(() => {}))
 }
 
 /**
@@ -103,6 +110,11 @@ export function webAuthn(options: webAuthn.Options): webAuthn.ReturnType {
 
   const router = from(rest)
 
+  /** Reads a challenge, consuming it atomically when the store implements `take`. */
+  function consume<value>(key: string) {
+    return kv.take ? kv.take<value>(key) : kv.get<value>(key)
+  }
+
   router.post(`${path}/register/options`, async (c) => {
     try {
       const body = await c.req.raw.json()
@@ -140,9 +152,17 @@ export function webAuthn(options: webAuthn.Options): webAuthn.ReturnType {
         Bytes.toString(new Uint8Array(deserialized.clientDataJSON)),
       ) as { challenge: string }
       const challenge = Hex.fromBytes(Base64.toBytes(clientData.challenge))
-      const stored = await kv.get<{ created: number; name: string; userId?: string }>(
-        `challenge:${challenge}`,
-      )
+      const credentialId = credential.id
+      const key = `credential:${credentialId}`
+      // Without an atomic `create`, duplicates are rejected by a read before
+      // the write. Run that read alongside the challenge read.
+      // A store with `take` consumes the challenge atomically, so it is
+      // single-use and needs no delete. Otherwise it is read here and deleted
+      // after the response.
+      const [stored, existing] = await Promise.all([
+        consume<{ created: number; name: string; userId?: string }>(`challenge:${challenge}`),
+        kv.create ? undefined : kv.get(key),
+      ])
       if (!stored || Date.now() - stored.created > challengeTtl * 1_000)
         throw new Error('Missing or expired challenge')
 
@@ -154,18 +174,19 @@ export function webAuthn(options: webAuthn.Options): webAuthn.ReturnType {
 
       const { aaguid } = result
       const { publicKey } = result.credential
-      const credentialId = credential.id
       // Base64url-encode the userId we registered with so it matches
       // the `userHandle` shape the authenticator emits on `/login`.
       // Callers see a consistent identifier across both flows.
       const userId = stored.userId
         ? Base64.fromBytes(Bytes.fromString(stored.userId), { pad: false, url: true })
         : undefined
-      const key = `credential:${credentialId}`
-      const created = await createCredential(kv, key, {
-        publicKey,
-        ...(userId ? { userId } : {}),
-      })
+      const value = { publicKey, ...(userId ? { userId } : {}) }
+      const created = await (async () => {
+        if (kv.create) return await kv.create(key, value)
+        if (existing) return false
+        await kv.set(key, value)
+        return true
+      })()
       if (!created) throw new Error('Credential already exists')
 
       const hook = await (async () => {
@@ -183,7 +204,10 @@ export function webAuthn(options: webAuthn.Options): webAuthn.ReturnType {
           throw error
         }
       })()
-      await kv.delete(`challenge:${challenge}`)
+      // Without `take`, the challenge was only read. It expires on its own, and
+      // replaying it cannot register the same credential twice, so its deletion
+      // does not hold the response.
+      if (!kv.take) await defer(c, kv.delete(`challenge:${challenge}`))
 
       // Successful registration is also a successful authentication for
       // the freshly-minted credential. Issue a session here so the
@@ -271,7 +295,7 @@ export function webAuthn(options: webAuthn.Options): webAuthn.ReturnType {
       const challenge = Hex.fromBytes(Base64.toBytes(clientData.challenge))
 
       const [stored, credentialData] = await Promise.all([
-        kv.get<number>(`challenge:${challenge}`),
+        consume<number>(`challenge:${challenge}`),
         kv.get<{ publicKey: string; userId?: string }>(`credential:${response.id}`),
       ])
       if (!stored || Date.now() - stored > challengeTtl * 1_000)
@@ -306,7 +330,7 @@ export function webAuthn(options: webAuthn.Options): webAuthn.ReturnType {
           })
           if (result) hookResponse = result
         } catch (error) {
-          await kv.delete(`challenge:${challenge}`)
+          if (!kv.take) await kv.delete(`challenge:${challenge}`)
           return Response.json(
             { error: error instanceof Error ? error.message : 'authentication rejected' },
             { status: 401 },
@@ -318,7 +342,7 @@ export function webAuthn(options: webAuthn.Options): webAuthn.ReturnType {
       // verification. No token, no cookie, no kv write. Useful for
       // hosts that mint their own session in `onAuthenticate` (e.g. JWTs).
       if (!session) {
-        await kv.delete(`challenge:${challenge}`)
+        if (!kv.take) await kv.delete(`challenge:${challenge}`)
         return Session.mergeResponse(
           {
             credentialId,
@@ -340,7 +364,7 @@ export function webAuthn(options: webAuthn.Options): webAuthn.ReturnType {
       const token = Session.generateToken()
       await Promise.all([
         kv.set(sessionKey(token), payload, { ttl: sessionTtl }),
-        kv.delete(`challenge:${challenge}`),
+        kv.take ? undefined : kv.delete(`challenge:${challenge}`),
       ])
 
       const json = {
@@ -420,6 +444,16 @@ export declare namespace webAuthn {
      * `create` is available, credential registration uses it to reject
      * duplicates atomically. Otherwise, registration falls back to
      * best-effort `get` then `set` storage.
+     *
+     * When `take` is available, challenges are consumed atomically and are
+     * strictly single-use. Otherwise they are read, then deleted: on
+     * runtimes with `waitUntil` (e.g. Cloudflare Workers), pass the execution
+     * context (`handler.fetch(request, env, ctx)`) so `/register` deletes its
+     * challenge after responding, while `/login` deletes its challenge before
+     * responding. Without `take` that deletion is best-effort: concurrent
+     * requests can read a challenge before it is deleted. With `create`, a
+     * registration challenge replayed in that window cannot register the same
+     * credential twice.
      */
     kv: Kv.Kv
     /**
