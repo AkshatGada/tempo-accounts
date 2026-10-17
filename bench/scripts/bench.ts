@@ -2,7 +2,8 @@
  * Accounts Bench: UX benchmark for the Tempo Wallet (popup and iframe) and WebAuthn adapters.
  *
  * Drives the bench app in headless Chrome with a CDP virtual WebAuthn
- * authenticator, and times register, login and send transaction per renderer.
+ * authenticator, and times register, login and send transaction per renderer, then
+ * register and login with Sign-In with Ethereum, an access key, or both.
  *
  * Usage: pnpm --filter bench bench [options]
  *   --url <url>              Bench app URL. @default http://localhost:5180
@@ -12,6 +13,8 @@
  *   --runs <n>               Runs per renderer. @default 3
  *   --renderers <list>       Comma-separated renderers. @default all
  *                            (tempoWallet/popup, tempoWallet/iframe, webAuthn)
+ *   --cases <list>           Comma-separated cases, run in report order. Needs a register case. @default all
+ *                            (login cases need a register case before them)
  *   --host <url>             Wallet page override for the Tempo Wallet renderers.
  *   --json <path>            Also writes every sample as JSON.
  *   --markdown <path>        Also writes a scored Markdown report.
@@ -41,18 +44,25 @@ type Case = Report.Case
 type Renderer = Report.Renderer
 type Sample = Report.Sample
 
-/** Wallet button that approves each case. */
+/** Wallet button that approves each kind of case. */
 const approvals = {
   login: /^(Continue|Sign in) with passkey$/,
   register: /^Create account$/,
   send: /^(Confirm|Approve|Send|Pay)\b/,
-} as const satisfies Record<Case, RegExp>
+} as const satisfies Record<(typeof Report.core)[number], RegExp>
+
+/**
+ * Follow-up approval that access-key cases may show after the first click: the wallet can
+ * confirm the key's spend permissions on an "Authorize Spend" screen of its own.
+ */
+const followup = /^Approve$/
 
 const timeout = 60_000
 
 const { values } = parseArgs({
   options: {
     baseline: { type: 'string' },
+    cases: { default: Report.cases.join(','), type: 'string' },
     host: { type: 'string' },
     json: { type: 'string' },
     markdown: { type: 'string' },
@@ -71,6 +81,15 @@ const selected = values.renderers.split(',').map((renderer) => {
     throw new Error(`Unknown renderer: ${renderer}`)
   return renderer as Renderer
 })
+
+const cases = values.cases.split(',').map((name) => {
+  if (!Report.cases.includes(name as Case)) throw new Error(`Unknown case: ${name}`)
+  return name as Case
+})
+const ordered = Report.cases.filter((name) => cases.includes(name))
+// Login and send need the account that a register case creates earlier in the same run.
+if (Report.kind(ordered[0]!) !== 'register')
+  throw new Error(`--cases must include a register case to run ${ordered[0]}.`)
 
 /** Page timeline entry written by `src/main.ts`. */
 type Entry = { action: string; error?: string; events: [string, number][] }
@@ -110,19 +129,24 @@ async function authenticate(
       transport: 'internal',
     },
   })
-  for (const credential of credentials.values())
+  for (const credential of credentials.values()) {
+    // A registration cut short (e.g. its popup closed) can report a credential without one.
+    if (!(credential as { rpId?: string | undefined }).rpId) continue
     await session.send('WebAuthn.addCredential', {
       authenticatorId,
       credential: credential as never,
     })
+  }
   // An assertion increments the credential's signature counter. Keep the latest
   // copy, so a later popup does not present a counter lower than the last one.
-  session.on('WebAuthn.credentialAdded', (event) =>
-    credentials.set(event.credential.credentialId, event.credential),
-  )
-  session.on('WebAuthn.credentialAsserted', (event) =>
-    credentials.set(event.credential.credentialId, event.credential),
-  )
+  // An event's copy can omit fields (such as `rpId`) that an earlier one carried, so merge.
+  const save = (credential: { credentialId: string }) =>
+    credentials.set(credential.credentialId, {
+      ...credentials.get(credential.credentialId),
+      ...credential,
+    })
+  session.on('WebAuthn.credentialAdded', (event) => save(event.credential))
+  session.on('WebAuthn.credentialAsserted', (event) => save(event.credential))
 }
 
 /** Resolves once the virtual authenticator is attached to a page of the current run. */
@@ -186,7 +210,7 @@ async function step(
   // renders it disabled while it prepares the request, and a click lands only once it is enabled.
   const button: Locator = wallet.getByRole('button', {
     disabled: false,
-    name: approvals[options.case],
+    name: approvals[Report.kind(options.case)],
   })
   try {
     await button.waitFor({ state: 'visible', timeout })
@@ -199,12 +223,33 @@ async function step(
   // must be attached by then. Awaited after `ready` to keep setup out of the timing.
   if (popup) await attached(wallet as Page)
 
-  if (options.case === 'register')
+  if (Report.kind(options.case) === 'register')
     await wallet.getByPlaceholder(/Email address or label/).fill(`bench-${Date.now()}`)
   const approved = Date.now()
   await button.click()
 
+  // Approves a follow-up screen if one appears. Its render counts toward Confirm, as a user
+  // would wait for it too.
+  let finished = false
+  if (options.case.endsWith('-key')) {
+    const approve = wallet.getByRole('button', { disabled: false, name: followup })
+    approve
+      .waitFor({ state: 'visible', timeout })
+      // The iframe wallet is reused, so a wait that outlives its case must not click a later
+      // case's screen.
+      .then(() => (finished ? undefined : approve.click()))
+      // Settles harmlessly when the case finishes without the screen and the wallet closes.
+      .catch(() => {})
+  }
+
   const { callback, entry, time } = await done()
+    .catch(async (error) => {
+      await screenshot(popup ? (wallet as Page) : page, `${renderer}-${options.case}-${run}`)
+      throw error
+    })
+    .finally(() => {
+      finished = true
+    })
   return {
     case: options.case,
     confirm: time - approved,
@@ -229,7 +274,12 @@ async function screenshot(page: Page, name: string) {
 async function measure(options: { renderer: Renderer; run: number; url: string }) {
   const { renderer, run } = options
   const results: Sample[] = []
-  const context = await browser.newContext({ ignoreHTTPSErrors: true })
+  const context = await browser.newContext({
+    ignoreHTTPSErrors: true,
+    // The SIWE cases have the public wallet page fetch the bench's local `/auth`,
+    // which Chrome's Local Network Access blocks unless granted.
+    permissions: ['local-network-access'],
+  })
   const credentials = new Map<string, { credentialId: string }>()
   // Each page's authenticator setup, awaited before the page is used.
   const authenticators = new WeakMap<Page, Promise<void>>()
@@ -249,24 +299,41 @@ async function measure(options: { renderer: Renderer; run: number; url: string }
   if (mode) url.searchParams.set('mode', mode)
   if (values.host) url.searchParams.set('host', values.host)
 
-  // The case in progress, so a thrown failure is recorded against it.
-  let current: Case = Report.cases[0]
+  // The case in progress, which a failure outside a case's own recovery is recorded against.
+  let current = ordered[0]!
   try {
     await attached(page)
     await page.goto(url.toString())
     await page.waitForFunction(() => '__bench' in window)
-    for (const name of Report.cases) {
+    for (const [index, name] of ordered.entries()) {
       current = name
-      if (name === 'login') await setup(page, 'disconnect')
-      if (name === 'send') await setup(page, 'fund')
-      const sample = await step(context, page, { case: name, renderer, run })
+      const sample = await (async (): Promise<Sample> => {
+        try {
+          // Every connect after the first starts signed out, so it requests its capabilities
+          // afresh (a connected account with an access key would skip the key prompt).
+          if (Report.kind(name) !== 'send' && index > 0) await setup(page, 'disconnect')
+          if (name === 'send') await setup(page, 'fund')
+          return await step(context, page, { case: name, renderer, run })
+        } catch (error) {
+          const message = (error as Error).message
+          console.error(`${renderer} run ${run} ${name} failed:`, message)
+          // A wallet left open on an unexpected screen would block the next case's click, so
+          // close any popup and reload the app.
+          for (const other of context.pages()) if (other !== page) await other.close()
+          await page.reload()
+          await page.waitForFunction(() => '__bench' in window)
+          // `total` is unused for a failed sample, since the summary skips failures.
+          return { case: name, error: message, renderer, run, total: 0 }
+        }
+      })()
       results.push(sample)
-      if (sample.error) break
+      // Later core cases depend on this one. Matrix cases only need a registered account.
+      if (sample.error && (Report.core as readonly Case[]).includes(name)) break
     }
   } catch (error) {
+    // The app failed to load or to recover, so this run ends here.
     const message = (error as Error).message
-    console.error(`${renderer} run ${run} failed:`, message)
-    // `total` is unused for a failed sample, since the summary skips failures.
+    console.error(`${renderer} run ${run} ${current} failed:`, message)
     results.push({ case: current, error: message, renderer, run, total: 0 })
   } finally {
     await context.close()
@@ -298,9 +365,9 @@ if (values.json)
     JSON.stringify(values.baseline ? { base: samples_base, head: samples } : samples, null, 2),
   )
 
-const summary = Report.summarize(samples, { renderers: selected, runs })
+const summary = Report.summarize(samples, { cases: ordered, renderers: selected, runs })
 const summary_base = values.baseline
-  ? Report.summarize(samples_base, { renderers: selected, runs })
+  ? Report.summarize(samples_base, { cases: ordered, renderers: selected, runs })
   : undefined
 console.table(Report.table(summary))
 
