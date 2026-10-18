@@ -209,6 +209,32 @@ describe('server', () => {
   })
 })
 
+describe('server: verifyAuthentication', () => {
+  test('behavior: returns the login response, except a `verified` field', async () => {
+    // e.g. a session `token` (`cookie: false`), and a `verified` field a hook merged in.
+    vi.stubGlobal('fetch', async () =>
+      Response.json({
+        credentialId: 'credential',
+        publicKey: '0x04ab',
+        token: 'session-token',
+        username: 'alice',
+        verified: true,
+      }),
+    )
+    const ceremony = WebAuthnCeremony.server({ url: 'https://example.com/webauthn' })
+
+    expect(await ceremony.verifyAuthentication({ id: 'credential' } as never))
+      .toMatchInlineSnapshot(`
+        {
+          "credentialId": "credential",
+          "publicKey": "0x04ab",
+          "token": "session-token",
+          "username": "alice",
+        }
+      `)
+  })
+})
+
 describe('server: prefetch', () => {
   /** Serialized credential whose client data carries challenge `0x01`. */
   const credential = {

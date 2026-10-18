@@ -22,6 +22,7 @@ export type WebAuthnCeremony = {
   /** Verify an authentication response and extract the public key. */
   verifyAuthentication: (
     response: Authentication.Response,
+    options?: verifyAuthentication.Options | undefined,
   ) => Promise<verifyAuthentication.ReturnType>
   /** Ends the server session, if the ceremony has one. Called on `wallet_disconnect`. */
   logout?: (() => Promise<void>) | undefined
@@ -62,6 +63,14 @@ export declare namespace verifyRegistration {
     /** Display name for the credential (e.g. user's email). */
     name?: string | undefined
     /**
+     * Resolves once the server may be sent the registration, e.g. after
+     * earlier logins and registrations have landed, so none replaces its
+     * session. A ceremony that registers with a server waits for it before
+     * sending `/register`; one that answers before verifying (see
+     * {@link deferred}) only delays its background verification.
+     */
+    ready?: Promise<unknown> | undefined
+    /**
      * Cancels background verification (see `verified`), which then rejects
      * with the signal's reason, and can no longer issue a session. The
      * `webAuthn` adapter cancels a verification that outlasts its wait.
@@ -99,6 +108,33 @@ export declare namespace getAuthenticationOptions {
 }
 
 export declare namespace verifyAuthentication {
+  type Options = {
+    /**
+     * The credential the caller already knows: the challenge it signed, its
+     * public key and RP ID. A {@link deferred} ceremony checks the signature
+     * against them and verifies the login with the server in the background.
+     */
+    credential?:
+      | {
+          challenge: Hex
+          publicKey: Hex
+          rpId: string
+        }
+      | undefined
+    /**
+     * Resolves once the server may be sent the login, e.g. after earlier
+     * registrations have landed, so none replaces its session. A ceremony
+     * that verifies logins with a server waits for it before sending
+     * `/login`; one that answers before verifying (see {@link deferred}) only
+     * delays its background verification.
+     */
+    ready?: Promise<unknown> | undefined
+    /**
+     * Cancels background verification (see `verified`), which then rejects
+     * with the signal's reason, and can no longer issue a session.
+     */
+    signal?: AbortSignal | undefined
+  }
   type ReturnType = {
     /** The authenticated credential's ID. */
     credentialId: string
@@ -108,6 +144,15 @@ export declare namespace verifyAuthentication {
     userId?: string | undefined
     /** Username associated with the account. */
     username?: string | null | undefined
+    /**
+     * Settles once the server has verified the login, when the ceremony
+     * verifies it in the background (see {@link deferred}). `session` is
+     * `false` when the outcome is unknown (every attempt failed in transit, a
+     * retry found the challenge consumed, or the server failed for a reason
+     * other than refusing the credential): the login wasn't refused, but no
+     * session of its own is in place. Rejects when the server refuses it.
+     */
+    verified?: Promise<{ session: boolean }> | undefined
   }
 }
 
@@ -250,8 +295,10 @@ function create(options: server.Options) {
       }
     },
 
-    async verifyRegistration(credential) {
-      return request('/register', challenges.body(credential))
+    async verifyRegistration(credential, options = {}) {
+      const body = challenges.body(credential)
+      await options.ready
+      return request('/register', body)
     },
 
     async getAuthenticationOptions(parameters = {}) {
@@ -272,8 +319,16 @@ function create(options: server.Options) {
       return challenges.issue()?.challenge
     },
 
-    async verifyAuthentication(response) {
-      return request('/login', response)
+    async verifyAuthentication(response, options = {}) {
+      await options.ready
+      // Every field the server answers with (e.g. a session `token`, or ones a
+      // hook merged in), except `verified`: the adapter reads it as the
+      // background verification, which a server-backed login doesn't have.
+      const { verified: _, ...result } = await request<verifyAuthentication.ReturnType>(
+        '/login',
+        response,
+      )
+      return result
     },
 
     async logout() {
@@ -516,8 +571,21 @@ export declare namespace server {
  * disconnect that follows; the account stays, and a later login with the
  * passkey works if the server stored it.
  *
+ * A login with a passkey the caller knows (`verifyAuthentication`'s
+ * `credential`, which the `webAuthn` adapter passes for its stored accounts)
+ * answers once the signature checks out against the stored public key, and
+ * `POST /login` runs in the background the same way. The session it issues
+ * likewise exists only once it lands, and the adapter makes logins and
+ * disconnects wait for it. A refusal ends the session in place and the
+ * adapter drops the account, as for a refused registration. A login whose
+ * outcome stays unknown (it failed in transit, or a retry found its challenge
+ * consumed, or the server failed for a reason other than refusing the
+ * credential) ends the session in place but keeps the account.
+ *
  * The request is sent with `keepalive`, so it completes when the page closes
- * right after answering, but retries only run while the page is open. If the
+ * right after answering, but retries only run while the page is open. A
+ * request that waits on `options.ready` (an earlier verification still in
+ * flight) isn't sent yet, so a page closed during that wait never sends it. If the
  * server rejects the registration while the page is open, the adapter removes
  * the account (an `accountsChanged` event) and keeps its public key in storage
  * under `registration:<credentialId>`. A later login with the passkey restores
@@ -538,12 +606,13 @@ export function deferred(options: deferred.Options): WebAuthnCeremony {
 
   const { ceremony: base, challenges } = create(options)
 
-  /** Posts the registration with `keepalive`, so it survives the page closing. */
-  async function register(
+  /** Posts to `path` with `keepalive`, so the request survives the page closing. */
+  async function post(
+    path: '/login' | '/register',
     body: unknown,
     signal: AbortSignal | undefined,
   ): Promise<{ publicKey?: Hex | undefined }> {
-    const response = await fetch(`${url}/register`, {
+    const response = await fetch(`${url}${path}`, {
       body: JSON.stringify(body),
       ...(credentials ? { credentials } : {}),
       headers: { 'Content-Type': 'application/json' },
@@ -556,22 +625,93 @@ export function deferred(options: deferred.Options): WebAuthnCeremony {
     if (response.status >= 500 || response.status === 408 || response.status === 429)
       throw new TypeError(`Request failed with status ${response.status}`)
     const json = await response.json()
-    if (!response.ok) throw new Error((json as { error?: string }).error ?? 'Request failed')
+    if (!response.ok)
+      throw Object.assign(new Error((json as { error?: string }).error ?? 'Request failed'), {
+        status: response.status,
+      })
     return json as { publicKey?: Hex | undefined }
+  }
+
+  /**
+   * Ends the session in place, once. Abortable, so a logout cancelled for a
+   * later session can't land after it and clear its cookie.
+   */
+  async function logout(signal: AbortSignal | undefined) {
+    const response = await fetch(`${url}/logout`, {
+      credentials: credentials ?? 'include',
+      method: 'POST',
+      ...(signal ? { signal } : {}),
+    })
+    // A server without a logout route has no session to end.
+    if (!response.ok && response.status !== 404)
+      throw Object.assign(new Error(`Logout failed with status ${response.status}`), {
+        status: response.status,
+      })
+  }
+
+  /**
+   * Ends the session in place, retrying failures in transit, 5xx, 408 and
+   * 429 responses with backoff (up to 30 s apart) until it succeeds. Gives up
+   * on any other error status (e.g. a 401 from a route that requires a
+   * session), which retrying can't change. With `options.attempts`, rejects
+   * with the last failure once that many attempts failed. Rejects with
+   * `signal`'s reason once it aborts.
+   */
+  async function end(signal: AbortSignal | undefined, options: { attempts?: number } = {}) {
+    const { attempts = Number.POSITIVE_INFINITY } = options
+    for (let attempt = 0; ; attempt++) {
+      signal?.throwIfAborted()
+      try {
+        return await logout(signal)
+      } catch (error) {
+        signal?.throwIfAborted()
+        const { status } = error as { status?: number }
+        if (status !== undefined && status < 500 && status !== 408 && status !== 429) return
+        if (attempt + 1 >= attempts) throw error
+      }
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(done, Math.min(250 * 2 ** attempt, 30_000))
+        signal?.addEventListener('abort', done, { once: true })
+        if (signal?.aborted) done()
+        function done() {
+          clearTimeout(timer)
+          signal?.removeEventListener('abort', done)
+          if (signal?.aborted) reject(signal.reason)
+          else resolve()
+        }
+      })
+    }
+  }
+
+  /**
+   * Whether a `/login` error is the server refusing the credential itself (it
+   * doesn't know it, the signature doesn't check out, or a hook denied it),
+   * rather than an error unrelated to the account (e.g. an expired challenge
+   * or a failing store).
+   */
+  function refused(error: unknown) {
+    const { message, status } = error as { message?: string; status?: number }
+    return (
+      status === 401 ||
+      status === 403 ||
+      message === 'Unknown credential' ||
+      message === 'Authentication failed'
+    )
   }
 
   return from({
     ...base,
 
     async verifyRegistration(credential, options = {}) {
-      const { signal } = options
+      const { ready, signal } = options
       const body = challenges.body(credential)
       const verified = (async () => {
+        await ready
         const { publicKey, session } = await (async () => {
           for (let attempt = 0; ; attempt++)
             try {
               signal?.throwIfAborted()
-              const { publicKey } = await register(body, signal)
+              const { publicKey } = await post('/register', body, signal)
               return { publicKey, session: true }
             } catch (error) {
               if (signal?.aborted) throw signal.reason
@@ -609,6 +749,76 @@ export function deferred(options: deferred.Options): WebAuthnCeremony {
       verified.catch(() => {})
       return {
         credentialId: credential.id,
+        publicKey: credential.publicKey,
+        verified,
+      }
+    },
+
+    async verifyAuthentication(response, options = {}) {
+      const { credential, ready, signal } = options
+      // Without the credential's public key, only the server can verify the
+      // login, so the caller waits for it.
+      const valid =
+        credential && typeof window !== 'undefined'
+          ? (() => {
+              try {
+                return Authentication.verify(response, {
+                  challenge: credential.challenge,
+                  origin: window.location.origin,
+                  publicKey: credential.publicKey,
+                  rpId: credential.rpId,
+                })
+              } catch {
+                return false
+              }
+            })()
+          : false
+      if (!credential || !valid) return base.verifyAuthentication(response, { ready })
+      const verified = (async () => {
+        await ready
+        try {
+          const answer = await (async () => {
+            for (let attempt = 0; ; attempt++)
+              try {
+                signal?.throwIfAborted()
+                return await post('/login', response, signal)
+              } catch (error) {
+                if (signal?.aborted) throw signal.reason
+                // As for registration. The first attempt's refusal of the
+                // credential is the server's answer. Any other error, or a
+                // retry's (an earlier attempt may have landed and consumed
+                // the challenge), leaves the outcome unknown.
+                const retryable = error instanceof TypeError || error instanceof SyntaxError
+                if (!retryable && attempt === 0 && refused(error)) throw error
+                if (!retryable || attempt >= 2) return undefined
+                await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** attempt))
+              }
+          })()
+          // The app was handed the account of the key checked here. If the
+          // server knows the credential by another key, refuse the login.
+          if (answer && answer.publicKey?.toLowerCase() !== credential.publicKey.toLowerCase())
+            throw new Error('Server stored a different public key')
+          // Unknown outcome: the login wasn't refused, so keep the account,
+          // and end any session in place, which may be an earlier account's.
+          // A logout that fails too (e.g. still offline) is retried until it
+          // succeeds or `signal` aborts, rather than drop the account or leave
+          // that session in place.
+          if (!answer) await end(signal)
+          return { session: !!answer }
+        } catch (error) {
+          // The app now runs as this account, so a session the server left
+          // in place (an earlier account's, or the one it just issued) must
+          // not stay, so end it, retrying as `end` does, but only a few times
+          // (under a second apart), so the refusal reaches the adapter and
+          // drops the account promptly. The refusal stays the answer either way.
+          if (!signal?.aborted) await end(signal, { attempts: 3 }).catch(() => {})
+          throw error
+        }
+      })()
+      // Observed by the adapter; keep an unobserved failure from going unhandled.
+      verified.catch(() => {})
+      return {
+        credentialId: response.id,
         publicKey: credential.publicKey,
         verified,
       }

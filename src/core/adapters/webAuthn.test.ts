@@ -165,6 +165,1080 @@ describe('prefetched challenges', () => {
   })
 })
 
+describe('deferred login', () => {
+  const origin = 'http://localhost'
+
+  /**
+   * Provider whose deferred ceremony runs against an in-process
+   * `Handler.webAuthn`. `/login` requests wait for `release`, and answer
+   * `refuse`'s error instead when it's set. With `unavailable` set, they fail
+   * at once with a 503.
+   */
+  function setup() {
+    const authenticator = Authenticator.create({ origin, rpId: 'localhost' })
+    vi.stubGlobal(
+      'window',
+      Object.assign(new EventTarget(), {
+        location: { hostname: 'localhost', origin },
+        navigator: { credentials: authenticator.credentials },
+      }),
+    )
+    const handler = handler_webAuthn({
+      kv: Kv.memory(),
+      origin,
+      path: '/webauthn',
+      rpId: 'localhost',
+      session: false,
+    })
+    const events: string[] = []
+    const gate = {
+      refuse: undefined as string | undefined,
+      release: () => {},
+      unavailable: false,
+      unavailable_logout: false,
+      /** When set, only the next `/logout` fails with a 503. */
+      unavailable_logout_once: false,
+      /** When set, `/register` requests wait for it. */
+      register: undefined as Promise<void> | undefined,
+      /** When set, `/register` requests are refused with it. */
+      refuse_register: undefined as string | undefined,
+      /** When set, `/logout` requests wait until they're aborted or `release_logout` is called. */
+      hold_logout: false,
+      release_logout: () => {},
+      /** When set, `/logout` requests are answered with this status. */
+      logout_status: undefined as number | undefined,
+      /** The latest `/register` request's signal. */
+      register_signal: undefined as AbortSignal | undefined,
+      /** When set, `/register` requests are stored, but answered with it. */
+      lose_register: undefined as string | undefined,
+    }
+    vi.stubGlobal('fetch', async (input: string | URL, init?: RequestInit) => {
+      const request = new Request(input, init)
+      const path = new URL(request.url).pathname
+      if (path === '/webauthn/logout') {
+        events.push('logout')
+        if (gate.unavailable_logout) {
+          if (gate.unavailable_logout_once) gate.unavailable_logout = false
+          return Response.json({}, { status: 503 })
+        }
+        if (gate.logout_status) return Response.json({}, { status: gate.logout_status })
+        if (gate.hold_logout)
+          await new Promise<void>((resolve, reject) => {
+            gate.release_logout = resolve
+            const signal = init?.signal
+            signal?.addEventListener('abort', () => {
+              events.push('logout aborted')
+              reject(signal.reason)
+            })
+          })
+      }
+      if (path === '/webauthn/register') {
+        events.push('register sent')
+        gate.register_signal = init?.signal ?? undefined
+        if (gate.register) {
+          await gate.register
+          events.push('register answered')
+        }
+        if (gate.refuse_register)
+          return Response.json({ error: gate.refuse_register }, { status: 400 })
+        if (gate.lose_register) {
+          await handler.fetch(request)
+          return Response.json({ error: gate.lose_register }, { status: 400 })
+        }
+      }
+      if (path === '/webauthn/login') {
+        events.push('login sent')
+        if (gate.unavailable) return Response.json({}, { status: 503 })
+        await new Promise<void>((resolve) => (gate.release = resolve))
+        events.push('login answered')
+        if (gate.refuse) return Response.json({ error: gate.refuse }, { status: 400 })
+      }
+      return handler.fetch(request)
+    })
+    const storage = Storage.memory()
+    const provider = Provider.create({
+      adapter: webAuthn({ ceremony: WebAuthnCeremony.deferred({ url: `${origin}/webauthn` }) }),
+      chains: [chain],
+      storage,
+    })
+    return { authenticator, events, gate, provider, storage }
+  }
+
+  /** Signs up, so the next connect logs in with a known passkey. */
+  async function signUp(provider: ReturnType<typeof setup>['provider']) {
+    const { accounts } = await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'register', name: 'alice' } }],
+    })
+    return accounts[0]!.address
+  }
+
+  test('behavior: answers a login with a known passkey before the server verifies it', async () => {
+    const { events, gate, provider } = setup()
+    const address = await signUp(provider)
+
+    const login = await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    events.push('connected')
+    // A disconnect waits for the login to land, so it ends that login's session.
+    const disconnected = provider
+      .request({ method: 'wallet_disconnect' })
+      .then(() => void events.push('disconnected'))
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+    await disconnected
+
+    expect({ address: login.accounts[0]!.address === address, events }).toMatchInlineSnapshot(`
+      {
+        "address": true,
+        "events": [
+          "register sent",
+          "login sent",
+          "connected",
+          "login answered",
+          "logout",
+          "disconnected",
+        ],
+      }
+    `)
+  })
+
+  test('behavior: drops the account and ends the session when the server refuses the login', async () => {
+    const { events, gate, provider } = setup()
+    const address = await signUp(provider)
+
+    const changed = new Promise<readonly string[]>((resolve) =>
+      provider.on('accountsChanged', resolve),
+    )
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    gate.refuse = 'Unknown credential'
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+
+    expect({
+      accounts: (await changed).includes(address),
+      events,
+    }).toMatchInlineSnapshot(`
+      {
+        "accounts": false,
+        "events": [
+          "register sent",
+          "login sent",
+          "login answered",
+          "logout",
+        ],
+      }
+    `)
+  })
+  test('behavior: cancels the logout of a refused login for a later login', async () => {
+    const { events, gate, provider } = setup()
+    await signUp(provider)
+
+    events.length = 0
+    gate.hold_logout = true
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    gate.refuse = 'Unknown credential'
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+    await vi.waitFor(() => expect(events).toContain('logout'))
+
+    // The next login waits for the refused one, then cancels its logout, so that logout can't
+    // land after the next login and end its session.
+    vi.useFakeTimers({ toFake: ['setTimeout'] })
+    const next = provider
+      .request({ method: 'wallet_connect', params: [{ capabilities: { method: 'login' } }] })
+      .catch(() => {})
+    await vi.advanceTimersByTimeAsync(10_000)
+    vi.useRealTimers()
+    await vi.waitFor(() => expect(events).toContain('logout aborted'))
+    await next
+
+    expect(events.slice(0, 4)).toMatchInlineSnapshot(`
+      [
+        "login sent",
+        "login answered",
+        "logout",
+        "logout aborted",
+      ]
+    `)
+  })
+
+  test('behavior: settles a login whose logout is cancelled mid-request at once', async () => {
+    const { events, gate, provider } = setup()
+    await signUp(provider)
+
+    gate.unavailable = true
+    gate.hold_logout = true
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    await vi.waitFor(() => expect(events).toContain('logout'), { timeout: 5_000 })
+
+    // A disconnect waits up to 10 s for that login, then cancels its logout mid-request.
+    vi.useFakeTimers({ toFake: ['setTimeout'] })
+    gate.hold_logout = false
+    await Promise.all([
+      provider.request({ method: 'wallet_disconnect' }),
+      vi.advanceTimersByTimeAsync(10_000),
+    ])
+    // The cancelled login no longer holds a later disconnect.
+    let done = false
+    const disconnected = provider
+      .request({ method: 'wallet_disconnect' })
+      .then(() => void (done = true))
+    await vi.advanceTimersByTimeAsync(100)
+    vi.useRealTimers()
+    await disconnected
+
+    expect({ aborted: events.includes('logout aborted'), done }).toMatchInlineSnapshot(`
+      {
+        "aborted": true,
+        "done": true,
+      }
+    `)
+  })
+
+  test('behavior: settles a login whose logout keeps answering with an error', async () => {
+    const { events, gate, provider } = setup()
+    const address = await signUp(provider)
+
+    // A logout route that requires a session answers 401 once the login failed.
+    gate.unavailable = true
+    gate.logout_status = 401
+    events.length = 0
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    await vi.waitFor(() => expect(events).toContain('logout'), { timeout: 5_000 })
+    await new Promise((resolve) => setTimeout(resolve, 600))
+
+    expect({
+      accounts: (await provider.request({ method: 'eth_accounts' })).includes(address),
+      logouts: events.filter((event) => event === 'logout').length,
+    }).toMatchInlineSnapshot(`
+      {
+        "accounts": true,
+        "logouts": 1,
+      }
+    `)
+  })
+
+  test('behavior: keeps the account and ends the session when the login fails in transit', async () => {
+    const { events, gate, provider } = setup()
+    const address = await signUp(provider)
+
+    gate.unavailable = true
+    events.length = 0
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    await vi.waitFor(() => expect(events).toContain('logout'), { timeout: 5_000 })
+
+    expect({
+      accounts: (await provider.request({ method: 'eth_accounts' })).includes(address),
+      events,
+    }).toMatchInlineSnapshot(`
+      {
+        "accounts": true,
+        "events": [
+          "login sent",
+          "login sent",
+          "login sent",
+          "logout",
+        ],
+      }
+    `)
+  })
+
+  test('behavior: retries the logout after a failed login until it ends the session', async () => {
+    const { events, gate, provider } = setup()
+    const address = await signUp(provider)
+
+    gate.unavailable = true
+    gate.unavailable_logout = true
+    events.length = 0
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    // The logout fails twice, then goes through.
+    await vi.waitFor(() => expect(events.filter((event) => event === 'logout').length).toBe(2), {
+      timeout: 5_000,
+    })
+    gate.unavailable_logout = false
+    await vi.waitFor(() => expect(events.filter((event) => event === 'logout').length).toBe(3), {
+      timeout: 5_000,
+    })
+    // Lets `track` settle.
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    expect({
+      accounts: (await provider.request({ method: 'eth_accounts' })).includes(address),
+      events,
+    }).toMatchInlineSnapshot(`
+      {
+        "accounts": true,
+        "events": [
+          "login sent",
+          "login sent",
+          "login sent",
+          "logout",
+          "logout",
+          "logout",
+        ],
+      }
+    `)
+  })
+
+  test('behavior: keeps the account when the login fails for a reason other than the credential', async () => {
+    const { events, gate, provider } = setup()
+    const address = await signUp(provider)
+
+    events.length = 0
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    gate.refuse = 'Missing or expired challenge'
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+    await vi.waitFor(() => expect(events).toContain('logout'))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    expect({
+      accounts: (await provider.request({ method: 'eth_accounts' })).includes(address),
+      events,
+    }).toMatchInlineSnapshot(`
+      {
+        "accounts": true,
+        "events": [
+          "login sent",
+          "login answered",
+          "logout",
+        ],
+      }
+    `)
+  })
+
+  test('behavior: answers a login before an earlier sign-up lands, and sends it after', async () => {
+    const { events, gate, provider } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    await signUp(provider)
+
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    events.push('connected')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    land()
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+
+    expect(events).toMatchInlineSnapshot(`
+      [
+        "register sent",
+        "connected",
+        "register answered",
+        "login sent",
+      ]
+    `)
+  })
+
+  test('behavior: answers a sign-up before an earlier one lands, and sends it after', async () => {
+    const { events, provider } = setup()
+    let land = () => {}
+    const gate_first = new Promise<void>((resolve) => (land = resolve))
+    // Only the first `/register` is held.
+    let held = false
+    const fetch_ = globalThis.fetch
+    vi.stubGlobal('fetch', async (input: string | URL, init?: RequestInit) => {
+      const path = new URL(new Request(input, init).url).pathname
+      if (path === '/webauthn/register' && !held) {
+        held = true
+        events.push('first sent')
+        await gate_first
+        events.push('first answered')
+      }
+      return fetch_(input, init)
+    })
+
+    await signUp(provider)
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'register', name: 'bob' } }],
+    })
+    events.push('second connected')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    land()
+    await vi.waitFor(() => expect(events.filter((e) => e === 'register sent').length).toBe(2))
+
+    expect(events).toMatchInlineSnapshot(`
+      [
+        "first sent",
+        "second connected",
+        "first answered",
+        "register sent",
+        "register sent",
+      ]
+    `)
+  })
+
+  test('behavior: keeps an account whose sign-up looked refused once its login lands', async () => {
+    const { authenticator, events, gate, provider } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    gate.lose_register = 'Missing or expired challenge'
+    const address = await signUp(provider)
+
+    // The sign-up looks refused while the login's passkey prompt is open, though the server
+    // stored it.
+    const get = authenticator.credentials.get.bind(authenticator.credentials)
+    authenticator.credentials.get = async (options) => {
+      land()
+      await vi.waitFor(() => expect(events).toContain('register answered'))
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      return get(options)
+    }
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const connected = (await provider.request({ method: 'eth_accounts' })).includes(address)
+    // The server stored the passkey after all, so the login lands with a session.
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+    await vi.waitFor(() => expect(events).toContain('login answered'))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    expect({
+      connected,
+      landed: (await provider.request({ method: 'eth_accounts' })).includes(address),
+    }).toMatchInlineSnapshot(`
+      {
+        "connected": true,
+        "landed": true,
+      }
+    `)
+  })
+
+  test("behavior: a stale login's unknown outcome doesn't drop a later login's account", async () => {
+    const { authenticator, events, gate, provider } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    gate.refuse_register = 'Missing or expired challenge'
+    const address = await signUp(provider)
+
+    // The sign-up is refused while the first login's passkey prompt is open.
+    const get = authenticator.credentials.get.bind(authenticator.credentials)
+    authenticator.credentials.get = async (options) => {
+      authenticator.credentials.get = get
+      land()
+      await vi.waitFor(() => expect(events).toContain('register answered'))
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      return get(options)
+    }
+    // Its outcome stays unknown while its logout is held.
+    gate.unavailable = true
+    gate.hold_logout = true
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    await vi.waitFor(() => expect(events).toContain('logout'), { timeout: 5_000 })
+
+    // A second login with the passkey, which the server knows after all.
+    gate.unavailable = false
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    // The first login settles without a session.
+    gate.release_logout()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const settled = (await provider.request({ method: 'eth_accounts' })).includes(address)
+
+    expect({ settled }).toMatchInlineSnapshot(`
+      {
+        "settled": true,
+      }
+    `)
+  })
+
+  test('behavior: restores an account a late registration refusal dropped once its login lands', async () => {
+    const { events, gate, provider, storage } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    // The server stores the passkey, but its answer is lost.
+    gate.lose_register = 'Missing or expired challenge'
+    const address = await signUp(provider)
+
+    // The login is answered before the registration's refusal arrives, and sent after it.
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    const dropped = new Promise<readonly string[]>((resolve) =>
+      provider.on('accountsChanged', resolve),
+    )
+    land()
+    const during = (await dropped).includes(address)
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+    await vi.waitFor(() => expect(events).toContain('login answered'))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    // It's restored as the active account and the last used credential, as its connect left them.
+    const [account] = provider.store.getState().accounts
+    expect({
+      active: (await provider.request({ method: 'eth_accounts' }))[0] === address,
+      during,
+      last:
+        account && 'credential' in account
+          ? (await storage.getItem('lastCredentialId')) === account.credential?.id
+          : false,
+    }).toMatchInlineSnapshot(`
+      {
+        "active": true,
+        "during": false,
+        "last": true,
+      }
+    `)
+  })
+
+  test('behavior: a login the server verifies restores access keys a refusal dropped earlier', async () => {
+    const { events, gate, provider } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    gate.lose_register = 'Missing or expired challenge'
+    const address = await signUp(provider)
+    const key = {
+      access: address,
+      address: '0x0000000000000000000000000000000000000002',
+      chainId: chain.id,
+      keyType: 'p256',
+    } as const
+    provider.store.setState({ accessKeys: [key] })
+    const dropped = new Promise<void>((resolve) => provider.on('accountsChanged', () => resolve()))
+    land()
+    await dropped
+
+    // The server stored the passkey after all: a login proves it.
+    gate.register = undefined
+    gate.lose_register = undefined
+    events.length = 0
+    const connected = provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+    await connected
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect({
+      accounts: (await provider.request({ method: 'eth_accounts' })).includes(address),
+      keys: provider.store.getState().accessKeys.length,
+    }).toMatchInlineSnapshot(`
+      {
+        "accounts": true,
+        "keys": 1,
+      }
+    `)
+  })
+
+  test('behavior: restores access keys stored after a refusal dropped the account', async () => {
+    const { events, gate, provider } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    gate.lose_register = 'Missing or expired challenge'
+    const address = await signUp(provider)
+    const dropped = new Promise<void>((resolve) => provider.on('accountsChanged', () => resolve()))
+    land()
+    await dropped
+    // e.g. a sign-up's access key saved after its account was dropped, on two chains.
+    provider.store.setState({
+      accessKeys: [chain.id, chain.id + 1].map((chainId) => ({
+        access: address,
+        address: '0x0000000000000000000000000000000000000002' as const,
+        chainId,
+        keyType: 'p256' as const,
+      })),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const removed = provider.store.getState().accessKeys.length
+    // Another account holds an authorization for the same key on the same chain.
+    const other = '0x0000000000000000000000000000000000000003' as const
+    provider.store.setState({
+      accessKeys: [
+        {
+          access: other,
+          address: '0x0000000000000000000000000000000000000002',
+          chainId: chain.id,
+          keyType: 'p256',
+        },
+      ],
+    })
+
+    // A login the server verifies proves the passkey.
+    gate.register = undefined
+    gate.lose_register = undefined
+    events.length = 0
+    const connected = provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+    await connected
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect({
+      removed,
+      restored: provider.store
+        .getState()
+        .accessKeys.filter(({ access }) => access === address)
+        .map(({ chainId }) => chainId - chain.id)
+        .sort(),
+    }).toMatchInlineSnapshot(`
+      {
+        "removed": 0,
+        "restored": [
+          0,
+          1,
+        ],
+      }
+    `)
+  })
+
+  test("behavior: a login whose passkey prompt fails doesn't cancel an earlier registration", async () => {
+    const { authenticator, gate, provider } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    await signUp(provider)
+    await vi.waitFor(() => expect(gate.register_signal).toBeDefined())
+
+    authenticator.credentials.get = async () => {
+      throw new DOMException('Cancelled', 'NotAllowedError')
+    }
+    vi.useFakeTimers({ toFake: ['setTimeout'] })
+    await provider
+      .request({ method: 'wallet_connect', params: [{ capabilities: { method: 'login' } }] })
+      .catch(() => {})
+    await vi.advanceTimersByTimeAsync(10_000)
+    vi.useRealTimers()
+    const aborted = gate.register_signal!.aborted
+    land()
+
+    expect(aborted).toMatchInlineSnapshot(`false`)
+  })
+
+  test('behavior: retries the logout after a refused login until it ends the session', async () => {
+    const { events, gate, provider } = setup()
+    const address = await signUp(provider)
+
+    events.length = 0
+    gate.unavailable_logout = true
+    gate.unavailable_logout_once = true
+    const changed = new Promise<readonly string[]>((resolve) =>
+      provider.on('accountsChanged', resolve),
+    )
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    gate.refuse = 'Unknown credential'
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+
+    expect({
+      accounts: (await changed).includes(address),
+      logouts: events.filter((event) => event === 'logout').length,
+    }).toMatchInlineSnapshot(`
+      {
+        "accounts": false,
+        "logouts": 2,
+      }
+    `)
+  })
+
+  test('behavior: drops a refused login promptly while its logout keeps failing', async () => {
+    const { events, gate, provider } = setup()
+    const address = await signUp(provider)
+
+    events.length = 0
+    gate.unavailable_logout = true
+    const changed = new Promise<readonly string[]>((resolve) =>
+      provider.on('accountsChanged', resolve),
+    )
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    gate.refuse = 'Unknown credential'
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+    const accounts = await Promise.race([
+      changed,
+      new Promise<undefined>((resolve) => setTimeout(resolve, 3_000)),
+    ])
+
+    expect({
+      dropped: accounts ? !accounts.includes(address) : false,
+      logouts: events.filter((event) => event === 'logout').length,
+    }).toMatchInlineSnapshot(`
+      {
+        "dropped": true,
+        "logouts": 3,
+      }
+    `)
+  })
+
+  test("behavior: a late login doesn't change a sign-up's last used credential", async () => {
+    const { authenticator, events, gate, provider, storage } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    gate.lose_register = 'Missing or expired challenge'
+    await signUp(provider)
+
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    const dropped = new Promise<void>((resolve) => provider.on('accountsChanged', () => resolve()))
+    land()
+    await dropped
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+
+    // A sign-up with a digest; the late login lands while its signature prompt is open.
+    gate.register = undefined
+    gate.lose_register = undefined
+    const get = authenticator.credentials.get.bind(authenticator.credentials)
+    authenticator.credentials.get = async (options) => {
+      authenticator.credentials.get = get
+      gate.release()
+      await vi.waitFor(() => expect(events).toContain('login answered'))
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      return get(options)
+    }
+    const { accounts } = await provider.request({
+      method: 'wallet_connect',
+      params: [
+        {
+          capabilities: {
+            digest: '0x0000000000000000000000000000000000000000000000000000000000000001',
+            method: 'register',
+            name: 'bob',
+          },
+        },
+      ],
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    const bob = provider.store
+      .getState()
+      .accounts.find((account) => account.address === accounts[0]!.address)
+    expect(
+      bob && 'credential' in bob
+        ? (await storage.getItem('lastCredentialId')) === bob.credential?.id
+        : false,
+    ).toMatchInlineSnapshot(`true`)
+  })
+
+  test('behavior: keeps dropped access keys across a second drop', async () => {
+    const { events, gate, provider } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    gate.lose_register = 'Missing or expired challenge'
+    const address = await signUp(provider)
+    provider.store.setState({
+      accessKeys: [
+        {
+          access: address,
+          address: '0x0000000000000000000000000000000000000002',
+          chainId: chain.id,
+          keyType: 'p256',
+        },
+      ],
+    })
+    // The login is answered, its sign-up's refusal drops the account with its key, and the
+    // login's outcome stays unknown, so the account is dropped again, without the key.
+    gate.unavailable = true
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    land()
+    await vi.waitFor(() => expect(events).toContain('logout'), { timeout: 5_000 })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    // A login the server verifies proves it.
+    gate.unavailable = false
+    gate.register = undefined
+    gate.lose_register = undefined
+    events.length = 0
+    const connected = provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+    await connected
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(provider.store.getState().accessKeys.length).toMatchInlineSnapshot(`1`)
+  })
+
+  test("behavior: a late login's restore keeps a newer connect's selection", async () => {
+    const { events, gate, provider } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    gate.lose_register = 'Missing or expired challenge'
+    const address = await signUp(provider)
+
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    const dropped = new Promise<void>((resolve) => provider.on('accountsChanged', () => resolve()))
+    land()
+    await dropped
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+
+    // Before that login lands, the user signs up another account.
+    gate.register = undefined
+    gate.lose_register = undefined
+    const { accounts } = await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'register', name: 'bob' } }],
+    })
+    gate.release()
+    await vi.waitFor(() => expect(events).toContain('login answered'))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    const connected = await provider.request({ method: 'eth_accounts' })
+    expect({
+      active: connected[0] === accounts[0]!.address,
+      restored: connected.includes(address),
+    }).toMatchInlineSnapshot(`
+      {
+        "active": true,
+        "restored": true,
+      }
+    `)
+  })
+
+  test("behavior: a cancelled connect doesn't stop a late login from selecting its account", async () => {
+    const { authenticator, events, gate, provider, storage } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    gate.lose_register = 'Missing or expired challenge'
+    const address = await signUp(provider)
+
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    const dropped = new Promise<void>((resolve) => provider.on('accountsChanged', () => resolve()))
+    land()
+    await dropped
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+
+    // Another connect whose passkey prompt is cancelled selects nothing.
+    const get = authenticator.credentials.get.bind(authenticator.credentials)
+    authenticator.credentials.get = async () => {
+      authenticator.credentials.get = get
+      throw new DOMException('Cancelled', 'NotAllowedError')
+    }
+    await provider
+      .request({ method: 'wallet_connect', params: [{ capabilities: { method: 'login' } }] })
+      .catch(() => {})
+    gate.release()
+    await vi.waitFor(() => expect(events).toContain('login answered'))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    // Restored as selected: active, and the last used credential again.
+    const [account] = provider.store.getState().accounts
+    expect({
+      active: (await provider.request({ method: 'eth_accounts' }))[0] === address,
+      last:
+        account && 'credential' in account
+          ? (await storage.getItem('lastCredentialId')) === account.credential?.id
+          : false,
+    }).toMatchInlineSnapshot(`
+      {
+        "active": true,
+        "last": true,
+      }
+    `)
+  })
+
+  test("behavior: a login after a disconnect doesn't restore what a refusal dropped", async () => {
+    const { events, gate, provider } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    gate.lose_register = 'Missing or expired challenge'
+    const address = await signUp(provider)
+    // e.g. the sign-up's access key.
+    provider.store.setState({
+      accessKeys: [
+        {
+          access: address,
+          address: '0x0000000000000000000000000000000000000002',
+          chainId: chain.id,
+          keyType: 'p256',
+        },
+      ],
+    })
+    const dropped = new Promise<void>((resolve) => provider.on('accountsChanged', () => resolve()))
+    land()
+    await dropped
+    await provider.request({ method: 'wallet_disconnect' })
+
+    // The server knows the passkey, so the login succeeds.
+    events.length = 0
+    const connected = provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+    await connected
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(provider.store.getState().accessKeys).toMatchInlineSnapshot(`[]`)
+  })
+
+  test('behavior: drops a refused login whose logout is cancelled', async () => {
+    const { events, gate, provider } = setup()
+    const address = await signUp(provider)
+
+    gate.hold_logout = true
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    gate.refuse = 'Unknown credential'
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    gate.release()
+    await vi.waitFor(() => expect(events).toContain('logout'))
+    const [stored] = provider.store.getState().accounts
+
+    // A sign-up waits up to 10 s for the refused login, then cancels its logout.
+    gate.hold_logout = false
+    gate.refuse = undefined
+    vi.useFakeTimers({ toFake: ['setTimeout'] })
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'register', name: 'bob' } }],
+    })
+    await vi.advanceTimersByTimeAsync(10_000)
+    vi.useRealTimers()
+    await vi.waitFor(() => expect(events).toContain('logout aborted'))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    // The refusal still stands: the refused account is dropped whenever it shows up again.
+    provider.store.setState({ accounts: [stored!, ...provider.store.getState().accounts] })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(
+      (await provider.request({ method: 'eth_accounts' })).includes(address),
+    ).toMatchInlineSnapshot(`false`)
+  })
+
+  test('behavior: keeps a refused sign-up dropped when its login has an unknown outcome', async () => {
+    const { authenticator, events, gate, provider, storage } = setup()
+    let land = () => {}
+    gate.register = new Promise<void>((resolve) => (land = resolve))
+    gate.refuse_register = 'Missing or expired challenge'
+    const address = await signUp(provider)
+
+    // The sign-up is refused while the login's passkey prompt is open, and the login's own
+    // outcome stays unknown.
+    const get = authenticator.credentials.get.bind(authenticator.credentials)
+    authenticator.credentials.get = async (options) => {
+      land()
+      await vi.waitFor(() => expect(events).toContain('register answered'))
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      return get(options)
+    }
+    gate.unavailable = true
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    await vi.waitFor(() => expect(events).toContain('logout'), { timeout: 5_000 })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    // Nor does a later login target the dropped passkey by default.
+    expect({
+      accounts: (await provider.request({ method: 'eth_accounts' })).includes(address),
+      last: await storage.getItem('lastCredentialId'),
+    }).toMatchInlineSnapshot(`
+      {
+        "accounts": false,
+        "last": null,
+      }
+    `)
+  })
+
+  test('behavior: a sign-up waits for a login still verifying', async () => {
+    const { events, gate, provider } = setup()
+    await signUp(provider)
+
+    events.length = 0
+    await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    const registered = provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'register', name: 'bob' } }],
+    })
+    await vi.waitFor(() => expect(events).toContain('login sent'))
+    // Gives the sign-up time to send `/register`, if it didn't wait.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    events.push('released')
+    gate.release()
+    await registered
+    await vi.waitFor(() => expect(events).toContain('register sent'))
+
+    expect(events).toMatchInlineSnapshot(`
+      [
+        "login sent",
+        "released",
+        "login answered",
+        "register sent",
+      ]
+    `)
+  })
+
+  test("behavior: doesn't report the passkey's name as the login's username", async () => {
+    const { gate, provider } = setup()
+    await signUp(provider)
+
+    const login = await provider.request({
+      method: 'wallet_connect',
+      params: [{ capabilities: { method: 'login' } }],
+    })
+    gate.release()
+
+    expect(login.accounts[0]!.capabilities).toMatchInlineSnapshot(`{}`)
+  })
+})
+
 describe('background registration', () => {
   const origin = 'http://localhost'
 
@@ -198,18 +1272,24 @@ describe('background registration', () => {
       ...local,
       async verifyRegistration(credential, parameters) {
         const result = await local.verifyRegistration(credential, parameters)
+        // Like a server ceremony: the registration is sent once `ready` resolves.
         const verified = options.reject
           ? Promise.reject(options.reject)
-          : new Promise<{ session: boolean }>((resolve, reject) => {
-              parameters?.signal?.addEventListener('abort', () => {
-                cancelled.push(credential.id)
-                reject(parameters.signal!.reason)
+          : (async () => {
+              await parameters?.ready
+              return new Promise<{ session: boolean }>((resolve, reject) => {
+                parameters?.signal?.addEventListener('abort', () => {
+                  cancelled.push(credential.id)
+                  reject(parameters.signal!.reason)
+                })
+                verifications.push({ reject, resolve: () => resolve({ session: true }) })
               })
-              verifications.push({ reject, resolve: () => resolve({ session: true }) })
-            })
+            })()
         return { ...result, verified }
       },
-      async verifyAuthentication(response) {
+      // Like a server ceremony: the login is sent once `ready` resolves.
+      async verifyAuthentication(response, parameters) {
+        await parameters?.ready
         logins()
         return local.verifyAuthentication(response)
       },
@@ -389,15 +1469,18 @@ describe('background registration', () => {
     `)
   })
 
-  test('behavior: the registration answered last owns the session', async () => {
+  test('behavior: a sign-up answers at once, but its registration waits for one still verifying', async () => {
     const { logins, provider, verifications } = setup()
     await register(provider, 'alice')
     await register(provider, 'bob')
+    // Bob's registration isn't sent while alice's may still set the session.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(verifications.length).toMatchInlineSnapshot(`1`)
+    verifications[0]!.resolve()
+    await vi.waitFor(() => expect(verifications.length).toBe(2))
+    verifications[1]!.resolve()
     const id = credentialOf(provider)?.id
 
-    // Bob registered last, but alice's response set the session cookie last.
-    verifications[1]!.resolve()
-    verifications[0]!.resolve()
     await provider.request({
       method: 'wallet_connect',
       params: [
@@ -407,8 +1490,109 @@ describe('background registration', () => {
       ],
     })
 
-    // Bob signs in with the server instead of the registration's shortcut.
-    expect(logins).toHaveBeenCalledTimes(1)
+    // Bob's registration set the session last, so the login takes its shortcut.
+    expect(logins).toHaveBeenCalledTimes(0)
+  })
+
+  test('behavior: signs a digest with the latest registration without waiting for it', async () => {
+    const { cancelled, logins, provider, verifications } = setup()
+    await register(provider)
+    const id = credentialOf(provider)?.id
+
+    // Its verification never answers, so a wait would hang the connect.
+    const { accounts } = await provider.request({
+      method: 'wallet_connect',
+      params: [
+        {
+          capabilities: { method: 'login', credentialId: id, digest: `0x${'1'.repeat(64)}` },
+        } as never,
+      ],
+    })
+
+    expect({
+      cancelled: cancelled.length,
+      logins: logins.mock.calls.length,
+      signed: !!accounts[0]!.capabilities.signature,
+      verifications: verifications.length,
+    }).toMatchInlineSnapshot(`
+      {
+        "cancelled": 0,
+        "logins": 0,
+        "signed": true,
+        "verifications": 1,
+      }
+    `)
+  })
+
+  test('behavior: fails a digest signed while its registration was refused', async () => {
+    const { authenticator, provider, verifications } = setup()
+    await register(provider)
+    const id = credentialOf(provider)?.id
+    // The registration is refused while the signature prompt is open.
+    const get = authenticator.credentials.get.bind(authenticator.credentials)
+    authenticator.credentials.get = async (options) => {
+      verifications[0]!.reject(new Error('Missing or expired challenge'))
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      return get(options)
+    }
+
+    await expect(
+      provider.request({
+        method: 'wallet_connect',
+        params: [
+          {
+            capabilities: { method: 'login', credentialId: id, digest: `0x${'1'.repeat(64)}` },
+          } as never,
+        ],
+      }),
+    ).rejects.toThrowErrorMatchingInlineSnapshot(
+      `[RpcResponse.InternalError: The server refused to store the passkey.]`,
+    )
+  })
+
+  test('behavior: waits for a stale registration before its login', async () => {
+    const { logins, provider, verifications } = setup()
+    await register(provider)
+    const id = credentialOf(provider)?.id
+    // Past the registration shortcut's 5 min, so the digest takes a server login.
+    const now = Date.now()
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 6 * 60_000)
+
+    const login = provider.request({
+      method: 'wallet_connect',
+      params: [
+        {
+          capabilities: { method: 'login', credentialId: id, digest: `0x${'1'.repeat(64)}` },
+        } as never,
+      ],
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const waited = logins.mock.calls.length === 0
+    verifications[0]!.resolve()
+    await login
+    clock.mockRestore()
+
+    expect({ logins: logins.mock.calls.length, waited }).toMatchInlineSnapshot(`
+      {
+        "logins": 1,
+        "waited": true,
+      }
+    `)
+  })
+
+  test("behavior: a sign-up whose passkey prompt fails doesn't cancel earlier verifications", async () => {
+    const { authenticator, cancelled, provider } = setup()
+    await register(provider, 'alice')
+    authenticator.credentials.create = async () => {
+      throw new Error('The operation either timed out or was not allowed.')
+    }
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+
+    await expect(register(provider, 'bob')).rejects.toThrow()
+    await vi.advanceTimersByTimeAsync(11_000)
+    vi.useRealTimers()
+
+    expect(cancelled.length).toMatchInlineSnapshot(`0`)
   })
 
   test('behavior: keeps an account whose page closed before the server answered', async () => {
@@ -449,10 +1633,11 @@ describe('background registration', () => {
   test('behavior: does not restore a rejected credential as the last used', async () => {
     const { provider, storage, verifications } = setup()
     await register(provider, 'alice')
-    await register(provider, 'bob')
+    const bob = register(provider, 'bob')
 
     // Bob's registration recorded alice's credential as the one used before.
     verifications[0]!.reject(new Error('Missing or expired challenge'))
+    await bob
     verifications[1]!.reject(new Error('Missing or expired challenge'))
 
     await vi.waitFor(async () =>

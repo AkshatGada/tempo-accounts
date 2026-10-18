@@ -8,6 +8,7 @@ import * as z from 'zod/mini'
 
 import type { OneOf } from '../../internal/types.js'
 import * as Adapter from '../Adapter.js'
+import type * as Store from '../Store.js'
 import * as WebAuthnCeremony from '../WebAuthnCeremony.js'
 import * as Rpc from '../zod/rpc.js'
 import * as u from '../zod/utils.js'
@@ -70,9 +71,14 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
       | { credentialId: string; publicKey: Hex.Hex; rpId: string; time: number; username?: string }
       | undefined
 
-    // Server registrations still in flight, by credential ID. Each settles once
+    // Server verifications still in flight (registrations and deferred logins). Each settles once
     // the server acknowledges or rejects the credential, or once it's cancelled.
-    const pending = new Map<string, { controller: AbortController; promise: Promise<void> }>()
+    const pending = new Set<{
+      controller: AbortController
+      /** The credential ID being verified. */
+      id: string
+      promise: Promise<void>
+    }>()
     // Account addresses of credentials the server rejected. Their accounts and
     // access keys are dropped whenever they show up in the store, including
     // ones stored after the rejection (e.g. while a sign-up's signature prompt
@@ -80,6 +86,17 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
     const rejected = new Set<string>()
     // Credential IDs of those rejections, so none is restored as the last used.
     const rejected_ids = new Set<string>()
+    // What `drop` removed, per account address, so a login that proves the
+    // server knows the credential after all puts it back.
+    const dropped = new Map<
+      string,
+      { accessKeys: Store.State['accessKeys']; account: Store.State['accounts'][number] }
+    >()
+    // The latest login per credential ID, so only it decides the credential's rejection.
+    const logins = new Map<string, object>()
+    // Successful connects and disconnects so far, so a late login restores its
+    // account as the selected one only if none has happened since.
+    let connects = 0
     // Dropped after the update that added them, so the provider emits both.
     store.subscribe(() => {
       if (rejected.size > 0) queueMicrotask(drop)
@@ -94,6 +111,25 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
       const kept = accounts.filter((account) => !rejected.has(account.address.toLowerCase()))
       const keys = accessKeys.filter((accessKey) => !rejected.has(accessKey.access.toLowerCase()))
       if (kept.length === accounts.length && keys.length === accessKeys.length) return
+      // Saved per address, including keys stored after the account was
+      // dropped, and merged with an earlier drop's, so dropping it again keeps
+      // its keys.
+      for (const address of rejected) {
+        const current = accounts.find((account) => account.address.toLowerCase() === address)
+        const own = accessKeys.filter((accessKey) => accessKey.access.toLowerCase() === address)
+        // Nothing of it is removed this time.
+        if (!current && own.length === 0) continue
+        const account = current ?? dropped.get(address)?.account
+        if (!account) continue
+        const earlier = dropped.get(address)?.accessKeys ?? []
+        dropped.set(address, {
+          accessKeys: [
+            ...earlier.filter((key) => !own.some((accessKey) => same(accessKey, key))),
+            ...own,
+          ],
+          account,
+        })
+      }
       // Keep the active account selected, unless it is the one dropped.
       const active = kept.indexOf(accounts[activeAccount]!)
       store.setState({
@@ -101,6 +137,49 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
         accounts: kept,
         activeAccount: Math.max(active, 0),
       })
+    }
+
+    /**
+     * Clears the rejection of a credential the server knows after all. With
+     * `options.restore` (a login that landed after the drop), also restores
+     * the account and access keys `drop` removed for it. With
+     * `options.selected` (no connect or disconnect since that login), it's
+     * restored as the active account and the last used credential, as its
+     * connect left them; otherwise the newer selection stays.
+     */
+    async function accept(
+      credential: { id: string; publicKey: Hex.Hex },
+      options: { restore?: boolean | undefined; selected?: boolean | undefined } = {},
+    ) {
+      const address = Account.fromWebAuthnP256(credential).address.toLowerCase()
+      rejected.delete(address)
+      rejected_ids.delete(credential.id)
+      if (!options.restore) return
+      const restored = dropped.get(address)
+      dropped.delete(address)
+      if (!restored) return
+      const { accessKeys, accounts } = store.getState()
+      const keys = restored.accessKeys.filter(
+        (key) => !accessKeys.some((accessKey) => same(accessKey, key)),
+      )
+      // Its connect stored the account again: restore only its access keys.
+      if (accounts.some((account) => account.address.toLowerCase() === address)) {
+        if (keys.length > 0) store.setState({ accessKeys: [...accessKeys, ...keys] })
+        return
+      }
+      if (!options.selected) {
+        store.setState({
+          accessKeys: [...accessKeys, ...keys],
+          accounts: [...accounts, restored.account],
+        })
+        return
+      }
+      store.setState({
+        accessKeys: [...keys, ...accessKeys],
+        accounts: [restored.account, ...accounts],
+        activeAccount: 0,
+      })
+      await storage.setItem('lastCredentialId', credential.id)
     }
 
     /** Drops the account of a credential the server never stored. */
@@ -140,44 +219,52 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
       const { controller, name, previous, verified } = options
       const promise = verified.then(
         async ({ session }) => {
-          // The session belongs to the registration answered last. Keep the
-          // shortcut only if that is the latest registration and its response
-          // carried the session (not a retry after a lost response).
-          if (!session || registered?.credentialId !== credential.id) registered = undefined
+          // A later registration is sent only once this one lands (see
+          // `ready`), so it can't replace a later one's session. Drop the
+          // shortcut only if it is this registration's and its response
+          // didn't carry the session (a retry after a lost response).
+          if (!session && registered?.credentialId === credential.id) registered = undefined
         },
         async (error) => {
           // Cancelled by `settle`: the outcome is unknown, so keep the account.
-          if (controller.signal.aborted) return
+          // A refusal stays the server's answer, even if its cleanup was cancelled.
+          if (controller.signal.aborted && error === controller.signal.reason) return
           // The server never stored the credential: drop the account the app
           // was handed, so it signs in or registers again.
           await reject(credential, { name, previous })
           throw error
         },
       )
-      pending.set(credential.id, { controller, promise })
+      // One entry per verification, so overlapping ones for a credential are all waited for.
+      const entry = { controller, id: credential.id, promise }
+      pending.add(entry)
       promise.then(
-        () => pending.delete(credential.id),
-        () => pending.delete(credential.id),
+        () => pending.delete(entry),
+        () => pending.delete(entry),
       )
     }
 
     /**
      * Waits for registrations still verifying, for up to `timeout_pending`,
      * then cancels the rest, so none can land later and replace the session of
-     * the login or disconnect that follows.
+     * the login, sign-up or disconnect that follows. Verifications of
+     * `options.except` (a credential ID) are neither waited for nor cancelled.
      */
-    async function settle() {
-      if (pending.size === 0) return
+    async function settle(options: { except?: string | undefined } = {}) {
+      const { except } = options
+      const waited = [...pending.values()].filter(({ id }) => id !== except)
+      if (waited.length === 0) return
       let timer: ReturnType<typeof setTimeout> | undefined
       const settled = await Promise.race([
-        Promise.allSettled([...pending.values()].map(({ promise }) => promise)).then(() => true),
+        Promise.allSettled(waited.map(({ promise }) => promise)).then(() => true),
         new Promise<false>((resolve) => {
           timer = setTimeout(() => resolve(false), timeout_pending)
         }),
       ]).finally(() => clearTimeout(timer))
       if (settled) return
-      registered = undefined
-      for (const { controller } of pending.values()) controller.abort()
+      // Only the shortcut of a registration cancelled here: a newer one may hold it meanwhile.
+      if (waited.some(({ id }) => id === registered?.credentialId)) registered = undefined
+      for (const { controller } of waited) controller.abort()
     }
 
     /** Returns the latest registration if it still owns a fresh server session. */
@@ -211,8 +298,14 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
         // verification is still pending; it rethrows from the `await` below.
         signature?.catch(() => {})
         const controller = new AbortController()
+        // A login or registration still verifying would replace this sign-up's session if it
+        // landed after it, so the server registration waits for it (the ceremony sends it once
+        // `ready` resolves; see `settle`). Started only once the passkey exists, so a sign-up
+        // that fails before it cancels nothing.
+        const ready = settle()
         const { publicKey, username, verified } = await ceremony.verifyRegistration(credential, {
           name: parameters.name,
+          ready,
           signal: controller.signal,
         })
         let failure: { error: unknown } | undefined
@@ -233,6 +326,9 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
             { controller, name: parameters.name, previous, verified },
           )
         }
+        // Counted with its selection write, so a late login landing during the
+        // signature prompt can't overwrite it.
+        connects++
         await storage.setItem('lastCredentialId', credential.id)
         const account = Account.fromWebAuthnP256({ id: credential.id, publicKey })
         const signed = signature ? await signature : undefined
@@ -255,21 +351,38 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
       async loadAccounts(parameters = {}) {
         const { digest, selectAccount } = parameters
 
-        // A login or the registration's session shortcut needs the server to
-        // know the credential, and a registration landing after a login would
-        // replace its session, so wait for registrations still verifying in
-        // the background. Their failures are handled by `track`.
-        await settle()
-
         const credentialId = selectAccount
           ? undefined
           : (parameters?.credentialId ??
             (await storage.getItem<string>('lastCredentialId')) ??
             undefined)
+
+        // A login needs the server to know the credential, and a registration
+        // landing after a login would replace its session, so the server login
+        // waits for registrations still verifying in the background (the
+        // ceremony sends it once `ready` resolves). Their failures are handled
+        // by `track`. The latest registration, still fresh, signing a digest
+        // with its own credential (the shortcut below) needs no login, and the
+        // session it issues when it lands is this account's, so it isn't waited
+        // for. A stale one is, since a login follows.
+        const latest =
+          digest && typeof credentialId === 'string' && current(credentialId)
+            ? credentialId
+            : undefined
+        // The shortcut uses the latest registration's session, which an
+        // earlier one landing after it would replace.
+        if (latest) await settle({ except: latest })
+
         const fresh = digest && typeof credentialId === 'string' ? current(credentialId) : undefined
         if (fresh && typeof credentialId === 'string') {
           const { publicKey, rpId, username } = fresh
           const account = Account.fromWebAuthnP256({ id: credentialId, publicKey }, { rpId })
+          const signature = await account.sign({ hash: digest! })
+          // Its registration may have been refused while the prompt was open,
+          // dropping the account: fail, as `createAccount` does.
+          if (rejected.has(account.address.toLowerCase()))
+            throw new Error('The server refused to store the passkey.')
+          connects++
           return {
             accounts: [
               {
@@ -278,7 +391,7 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
                 credential: { id: credentialId, publicKey, rpId },
               },
             ],
-            signature: await account.sign({ hash: digest! }),
+            signature,
             username,
           }
         }
@@ -315,17 +428,74 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
           await signed.catch(() => {})
           return await Authentication.sign({ options })
         })()
-        const { publicKey, username } = await ceremony.verifyAuthentication(response)
-        // The server session now belongs to this login.
-        registered = undefined
-        // The server knows the credential, even if its registration looked
-        // rejected (e.g. every response to it was lost).
-        rejected.delete(
-          Account.fromWebAuthnP256({ id: response.id, publicKey }).address.toLowerCase(),
+        // The known credential's public key lets a deferred ceremony check the
+        // passkey's signature itself and verify the login in the background.
+        // Started once the passkey answered, so a prompt that fails or is
+        // cancelled leaves earlier registrations alone.
+        const ready = settle()
+        const controller = new AbortController()
+        const { publicKey, username, verified } = await ceremony.verifyAuthentication(
+          response,
+          known && response.id === credentialId
+            ? {
+                credential: {
+                  challenge: options.publicKey!.challenge,
+                  publicKey: known.publicKey,
+                  rpId: known.rpId,
+                },
+                ready,
+                signal: controller.signal,
+              }
+            : { ready, signal: controller.signal },
         )
-        rejected_ids.delete(response.id)
+        // The server session now belongs to this login. Counted once it
+        // succeeded, so a failed connect selects nothing.
+        registered = undefined
+        const connect = ++connects
+        // The server knows the credential, even if its registration looked
+        // rejected (e.g. every response to it was lost), so the account is kept.
+        const was_rejected = rejected_ids.has(response.id)
+        // This connect stores the account again. A login the server verified
+        // already also restores the access keys a refusal dropped.
+        await accept({ id: response.id, publicKey }, { restore: !verified, selected: true })
 
+        const previous = (await storage.getItem<string>('lastCredentialId')) ?? undefined
         await storage.setItem('lastCredentialId', response.id)
+        // A login verified in the background proves that only once it lands
+        // with a session, which also clears a rejection that arrived while it
+        // waited. Until then the account is kept, so connecting doesn't drop
+        // it. An unknown outcome restores the rejection, unless a later login
+        // with the credential has started since (a refusal drops it in `track`).
+        const login = {}
+        logins.set(response.id, login)
+        if (verified)
+          verified.then(
+            ({ session }) => {
+              // Only the latest login with the credential decides its rejection.
+              if (logins.get(response.id) !== login) return
+              if (session)
+                return accept(
+                  { id: response.id, publicKey },
+                  { restore: true, selected: connects === connect },
+                )
+              if (!was_rejected || controller.signal.aborted) return
+              return reject({ id: response.id, publicKey }, { name: known?.label ?? '', previous })
+            },
+            () => {},
+          )
+        // Tracked like a registration verified in the background: logins and
+        // disconnects wait for it, and if the server refuses it, the account
+        // is dropped (an `accountsChanged` event) as the server's answer.
+        if (verified)
+          track(
+            { id: response.id, publicKey },
+            {
+              controller,
+              name: known?.label ?? '',
+              previous,
+              verified,
+            },
+          )
 
         const account = Account.fromWebAuthnP256({ id: response.id, publicKey }, { rpId })
 
@@ -355,12 +525,26 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
       },
     })(parameters)
 
-    /** Looks up a credential's RP ID from the latest registration or stored accounts. */
-    function find(credentialId: string): { rpId: string } | undefined {
-      if (registered?.credentialId === credentialId) return { rpId: registered.rpId }
+    /**
+     * Looks up a credential's public key, RP ID and label from the latest
+     * registration or stored accounts.
+     */
+    function find(
+      credentialId: string,
+    ): { label?: string | undefined; publicKey: Hex.Hex; rpId: string } | undefined {
+      if (registered?.credentialId === credentialId)
+        return {
+          ...(registered.username ? { label: registered.username } : {}),
+          publicKey: registered.publicKey,
+          rpId: registered.rpId,
+        }
       for (const account of store.getState().accounts)
         if ('credential' in account && account.credential?.id === credentialId)
-          return { rpId: account.credential.rpId }
+          return {
+            ...('label' in account && account.label ? { label: account.label } : {}),
+            publicKey: account.credential.publicKey,
+            rpId: account.credential.rpId,
+          }
       return undefined
     }
 
@@ -375,6 +559,9 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
       // A registration landing after logout would restore its session, so
       // wait for it, or cancel it (see `settle`).
       await settle()
+      // A later login mustn't restore accounts or access keys this disconnect removes.
+      dropped.clear()
+      connects++
       await ceremony.logout?.().catch(() => {})
     }
 
@@ -412,6 +599,15 @@ export declare namespace webAuthn {
     /** Reverse DNS identifier. @default `com.{lowercase name}` */
     rdns?: string | undefined
   }
+}
+
+/** Whether two access keys are the same authorization: the same key, for the same account, on the same chain. */
+function same(a: Store.State['accessKeys'][number], b: Store.State['accessKeys'][number]): boolean {
+  return (
+    a.access.toLowerCase() === b.access.toLowerCase() &&
+    a.address.toLowerCase() === b.address.toLowerCase() &&
+    a.chainId === b.chainId
+  )
 }
 
 /** Whether two credential request options ask the authenticator for the same assertion. */
