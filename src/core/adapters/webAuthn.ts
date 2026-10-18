@@ -189,7 +189,12 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
 
     const base = local({
       async createAccount(parameters) {
-        const { options } = await ceremony.getRegistrationOptions(parameters)
+        const { options } = await ceremony.getRegistrationOptions({
+          ...parameters,
+          // A random `userId` by default, so passkeys with the same name don't share a user
+          // handle. Prefetching ceremonies (`WebAuthnCeremony.server`) pick their own.
+          userId: parameters.userId ?? (ceremony.prefetch ? undefined : Hex.random(16)),
+        })
         const rpId = options.publicKey?.rp.id
         if (!rpId) throw new Error('rpId is required')
         const credential = await Registration.create({ options })
@@ -280,9 +285,11 @@ export function webAuthn(options: webAuthn.Options = {}): Adapter.Adapter {
 
         // A known credential's request options are deterministic (challenge,
         // credential and RP ID), so build them locally and prompt for the
-        // passkey while the ceremony registers the challenge, not after.
+        // passkey while the ceremony registers the challenge, not after. A
+        // challenge the ceremony prefetched is registered already.
         const known = typeof credentialId === 'string' ? find(credentialId) : undefined
-        const challenge = digest ?? (known ? Hex.random(32) : undefined)
+        const challenge =
+          digest ?? (known ? (ceremony.takeChallenge?.() ?? Hex.random(32)) : undefined)
         const options_local =
           known && typeof credentialId === 'string'
             ? core_Authentication.getOptions({ challenge, credentialId, rpId: known.rpId }).options
