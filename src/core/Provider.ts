@@ -248,6 +248,11 @@ export function create(options: create.Options = {}): create.ReturnType {
     return await instance.getAccount(options)
   }
 
+  async function assertAccessKeyAccount(address: Address.Address) {
+    if (instance.assertAccount) await instance.assertAccount({ address })
+    else if (instance.getAccount) await getAdapterAccount({ address })
+  }
+
   function getWalletClient(options: {
     account: Awaited<Adapter.getAccount.ReturnType>['account']
     chainId?: number | undefined
@@ -306,6 +311,7 @@ export function create(options: create.Options = {}): create.ReturnType {
         })(),
       })
       const address = parameters.from ?? state.accounts[state.activeAccount]?.address
+      if (address) await assertAccessKeyAccount(address)
       const transaction = address
         ? await AccessKeyTransaction.create({
             address,
@@ -345,6 +351,7 @@ export function create(options: create.Options = {}): create.ReturnType {
         })(),
       })
       const address = parameters.from ?? state.accounts[state.activeAccount]?.address
+      if (address) await assertAccessKeyAccount(address)
       const transaction = address
         ? await AccessKeyTransaction.create({
             address,
@@ -395,6 +402,7 @@ export function create(options: create.Options = {}): create.ReturnType {
         })(),
       })
       const address = parameters.from ?? state.accounts[state.activeAccount]?.address
+      if (address) await assertAccessKeyAccount(address)
       const transaction = address
         ? await AccessKeyTransaction.create({
             address,
@@ -882,6 +890,7 @@ export function create(options: create.Options = {}): create.ReturnType {
     const account = AddressUtil.from(info.account.address)
     if (!account) return undefined
     assertMppAccountConnected(account)
+    await assertAccessKeyAccount(account)
 
     if (options_.accessKey) {
       const authority =
@@ -1018,7 +1027,17 @@ export function create(options: create.Options = {}): create.ReturnType {
                       params: undefined,
                     })
 
-                    store.setState({ accounts: resolveAccounts(accounts), activeAccount: 0 })
+                    store.setState({
+                      accounts: resolveAccounts(accounts),
+                      accessKeys: store
+                        .getState()
+                        .accessKeys.filter((key) =>
+                          accounts.some((account) =>
+                            AddressUtil.isEqual(account.address, key.access),
+                          ),
+                        ),
+                      activeAccount: 0,
+                    })
 
                     return accounts.map(
                       (a) => a.address,
@@ -1122,7 +1141,8 @@ export function create(options: create.Options = {}): create.ReturnType {
                         client,
                         store,
                       })
-                      if (transaction)
+                      if (transaction) {
+                        await assertAccessKeyAccount(address)
                         try {
                           return await transaction.fill({
                             ...parameters,
@@ -1133,6 +1153,7 @@ export function create(options: create.Options = {}): create.ReturnType {
                         } catch {
                           // Fall through to the root account fill.
                         }
+                      }
                     }
 
                     return await fill()
@@ -1517,6 +1538,13 @@ export function create(options: create.Options = {}): create.ReturnType {
 
                     store.setState({
                       accounts: resolveAccounts(accounts),
+                      accessKeys: store
+                        .getState()
+                        .accessKeys.filter((key) =>
+                          accounts.some((account) =>
+                            AddressUtil.isEqual(account.address, key.access),
+                          ),
+                        ),
                       activeAccount: 0,
                       // Persist absolutized auth URLs so a later
                       // `wallet_disconnect` can hit logout even when the

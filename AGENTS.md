@@ -128,3 +128,12 @@
 - **PostMessage iframe color schemes must match the wallet page** — read the explicit `scheme` URL parameter when mounting the iframe. A mismatched scheme can make its transparent canvas opaque black on light macOS.
 - **Normalize no-expiry authorization metadata** -- `expiry: 0` is the request compatibility value for non-expiring access keys. Canonical signed metadata uses absent expiry (RPC `null`); stored zero from older SDK versions must remain selectable. Do not confuse this with on-chain metadata expiry zero for missing/revoked keys, and preserve omitted permissions versus explicit empty lists.
 - **Remove sprintf-js through its YAML parent** -- `@istanbuljs/load-nyc-config@1.1.0` calls `js-yaml.load()`, so its dependency can be scoped to js-yaml v4 to remove argparse v1 and unpatched sprintf-js. Keep the override scoped to this caller and verify YAML configuration loading; other v3 callers may rely on removed APIs or schemas.
+
+## Access-key lifecycle invariants
+
+- Validate the adapter's current account selection before using locally retained access keys; persisted account history is not session authorization.
+- A synchronous revocation API can still return a pending receipt. Remove local key state only after successful execution, or an explicit already-unavailable-key error.
+- Multi-account integration fixtures must reauthorize a payer key after replacing the connected wallet; restoring account history alone must not restore pruned signing authority.
+
+- Retained-key authority checks must cover MPP resolution and fill signing, including action-based adapters such as Privy. Unsigned root fills must remain available when no usable key matches.
+- Memory KV capacity is opt-in: shared authentication stores also hold durable credentials and sessions, so a default hard cap can deny login. Cache TTLs must reach backing storage for reclamation.
